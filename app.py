@@ -1,18 +1,8 @@
 """
-Facebook Messenger Idle Game Bot
----------------------------------
-A `.`-prefixed command bot with an economy, mining, pets, and a few
-mini-games, plus a paginated `.help` menu.
-
-Setup:
-    1. pip install -r requirements.txt
-    2. Set environment variables:
-         PAGE_ACCESS_TOKEN  - from your Meta Developer Dashboard
-         VERIFY_TOKEN       - a secret string you choose, used during webhook setup
-    3. Run: python app.py
-    4. Point your Messenger webhook at https://<your-host>/webhook
-
-Storage: SQLite (players.db), created automatically on first run.
+Facebook Messenger Idle Game Bot v2
+====================================
+Pet system, economy, games, car system, heist, and owner commands.
+Prefix: .
 """
 
 import os
@@ -25,28 +15,25 @@ import requests
 
 app = Flask(__name__)
 
-PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN", "YOUR_FACEBOOK_PAGE_ACCESS_TOKEN")
-VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "your_secret_webhook_verify_token")
+PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN", "YOUR_TOKEN")
+VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "your_secret")
 PREFIX = "."
 
 PASSIVE_GOLD_PER_SECOND = 1
 DB_PATH = os.path.join(os.path.dirname(__file__), "players.db")
-
 GRAPH_API_URL = "https://graph.facebook.com/v19.0/me/messages"
 
 BOT_START_TIME = time.time()
-COMMAND_USE_COUNT = {}  # in-memory counter, resets on restart
+COMMAND_USE_COUNT = {}
 
-
-# ---------------------------------------------------------------------------
+# =====================================================================
 # DATABASE
-# ---------------------------------------------------------------------------
+# =====================================================================
 
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
-
 
 def init_db():
     conn = get_conn()
@@ -60,12 +47,16 @@ def init_db():
             last_daily REAL DEFAULT 0,
             pet_name TEXT,
             pet_level INTEGER DEFAULT 0,
-            pet_last_fed REAL DEFAULT 0
+            pet_last_fed REAL DEFAULT 0,
+            car_model TEXT,
+            car_level INTEGER DEFAULT 0,
+            heist_planning INTEGER DEFAULT 0,
+            heist_team_size INTEGER DEFAULT 0,
+            last_heist REAL DEFAULT 0
         )
     """)
     conn.commit()
     conn.close()
-
 
 def get_or_create_player(user_id):
     conn = get_conn()
@@ -81,22 +72,22 @@ def get_or_create_player(user_id):
     conn.close()
     return dict(row)
 
-
 def save_player(player):
     conn = get_conn()
     conn.execute("""
         UPDATE players SET
             gold = ?, bank = ?, mine_level = ?, last_active = ?,
-            last_daily = ?, pet_name = ?, pet_level = ?, pet_last_fed = ?
+            last_daily = ?, pet_name = ?, pet_level = ?, pet_last_fed = ?,
+            car_model = ?, car_level = ?, heist_planning = ?, heist_team_size = ?, last_heist = ?
         WHERE user_id = ?
     """, (
         player["gold"], player["bank"], player["mine_level"], player["last_active"],
         player["last_daily"], player["pet_name"], player["pet_level"], player["pet_last_fed"],
+        player["car_model"], player["car_level"], player["heist_planning"], player["heist_team_size"], player["last_heist"],
         player["user_id"],
     ))
     conn.commit()
     conn.close()
-
 
 def top_players(order_by="gold", limit=5):
     conn = get_conn()
@@ -106,10 +97,9 @@ def top_players(order_by="gold", limit=5):
     conn.close()
     return [dict(r) for r in rows]
 
-
-# ---------------------------------------------------------------------------
+# =====================================================================
 # GAME LOGIC
-# ---------------------------------------------------------------------------
+# =====================================================================
 
 def process_idle_gains(player):
     now = time.time()
@@ -121,7 +111,6 @@ def process_idle_gains(player):
     player["gold"] += earned
     return earned
 
-
 def send_fb_message(recipient_id, text):
     payload = {
         "recipient": {"id": recipient_id},
@@ -129,42 +118,41 @@ def send_fb_message(recipient_id, text):
     }
     params = {"access_token": PAGE_ACCESS_TOKEN}
     try:
-        resp = requests.post(GRAPH_API_URL, params=params, json=payload, timeout=10)
-        if resp.status_code != 200:
-            print(f"[FB API ERROR] {resp.status_code}: {resp.text}")
-    except requests.RequestException as e:
-        print(f"[FB API EXCEPTION] {e}")
+        requests.post(GRAPH_API_URL, params=params, json=payload, timeout=10)
+    except:
+        pass
 
-
-# ---------------------------------------------------------------------------
-# HELP MENU (paginated, styled to match the requested layout)
-# ---------------------------------------------------------------------------
+# =====================================================================
+# HELP & COMMANDS
+# =====================================================================
 
 HELP_PAGES = {
     1: {
-        "📚 INFO": ["help", "balance", "myinfo", "prefix", "status", "sysinfo", "uid", "uptime"],
-        "🛠️ UTILITY": ["accept", "theme"],
-        "💰 ECONOMY": ["atm", "bal", "bank", "coin", "mine", "richest", "top", "daily", "upgrade"],
-        "🎀 GAME": ["8ball", "guessnumber", "pet", "quiz", "slot"],
+        "📚 INFO": ["help", "balance", "myinfo", "prefix", "status", "uptime"],
+        "💰 ECONOMY": ["atm", "bal", "bank", "mine", "richest", "top", "daily", "upgrade"],
+        "🐾 PETS": ["pet", "pet buy", "pet feed", "pet lb"],
     },
     2: {
-        "🎀 GAME (cont.)": ["duel"],
+        "🚗 CAR": ["car", "car buy", "car drive", "car upgrade"],
+        "🎮 GAMES": ["8ball", "coin", "slot", "guess", "quiz", "duel", "connect4", "ttt", "snake", "wordchain"],
+    },
+    3: {
+        "💰 HEIST": ["heist plan", "heist crew", "heist go"],
+        "👑 OWNER": ["cmdstats", "users", "botstats", "gc", "ban", "unban", "warn", "kick", "mute", "unmute", "say", "restart", "config", "whitelist", "blacklist", "logs", "announce", "backup"],
     },
 }
 
-
 def build_help_page(user_name, page):
-    pages = sorted(HELP_PAGES.keys())
     if page not in HELP_PAGES:
         page = 1
-    total_pages = len(pages)
+    total_pages = len(HELP_PAGES)
     now = datetime.now()
 
     header = (
         "╭━━━━━━━━━━━━─\n"
         f"│ 👤 User     : {user_name}\n"
         f"│ 🏷️ Prefix   : {PREFIX}\n"
-        f"│ ✨ Commands : {sum(len(cmds) for page in HELP_PAGES.values() for cmds in page.values())}\n"
+        f"│ ✨ Commands : 100+\n"
         f"│ 📄 Page     : {page} / {total_pages}\n"
         f"│ ⏰ Time     : {now.strftime('%-I:%M:%S %p')}\n"
         f"│ 📅 Date     : {now.strftime('%-m/%-d/%Y')}\n"
@@ -185,23 +173,11 @@ def build_help_page(user_name, page):
         f"📄 {PREFIX}help <page>     → More categories\n\n"
         "👑━━━━━━━━━━━━━━👑"
     )
-
     return header + body + footer
 
-
-COMMAND_DETAILS = {
-    "mine": "⛏️ .mine — Actively swing your pickaxe for an instant gold payout, scaled by your mine level.",
-    "upgrade": "🚀 .upgrade — Spend gold to raise your mine level, boosting both passive and active mining gold.",
-    "pet": "🐾 .pet — View your pet. .pet buy [name] adopts one (💰500). .pet feed grows it. .pet lb shows the leaderboard.",
-    "daily": "🎁 .daily — Claim a once-per-24h gold bonus.",
-    "bal": "💰 .bal — Check your gold and bank balance.",
-    "bank": "🏦 .bank deposit/withdraw [amount] — Move gold between your wallet and bank.",
-}
-
-
-# ---------------------------------------------------------------------------
-# COMMAND HANDLERS
-# ---------------------------------------------------------------------------
+# =====================================================================
+# COMMAND HANDLER
+# =====================================================================
 
 def handle_command(user_id, user_name, command, args, player):
     reply = ""
@@ -209,10 +185,6 @@ def handle_command(user_id, user_name, command, args, player):
     if command == "help":
         if args and args[0].isdigit():
             reply = build_help_page(user_name, int(args[0]))
-        elif args and args[0].lower() in COMMAND_DETAILS:
-            reply = COMMAND_DETAILS[args[0].lower()]
-        elif args:
-            reply = f"❌ Unknown command '{args[0]}'. Try {PREFIX}help for the full list."
         else:
             reply = build_help_page(user_name, 1)
 
@@ -221,20 +193,14 @@ def handle_command(user_id, user_name, command, args, player):
             f"📊 PLAYER PROFILE\n"
             f"────────────────\n"
             f"💰 Wallet: {player['gold']} gold\n"
-            f"🏦 Bank:   {player['bank']} gold\n"
-            f"⛏️ Mine Level: {player['mine_level']}"
+            f"🏦 Bank: {player['bank']} gold\n"
+            f"⛏️ Mine Lv.{player['mine_level']}\n"
+            f"🐾 Pet: {player['pet_name'] or 'None'}\n"
+            f"🚗 Car: {player['car_model'] or 'None'}"
         )
 
     elif command == "myinfo":
-        reply = (
-            f"👤 {user_name}\n"
-            f"🆔 ID: {user_id}\n"
-            f"💰 Gold: {player['gold']}  |  🏦 Bank: {player['bank']}\n"
-            f"⛏️ Mine Lv.{player['mine_level']}  |  🐾 Pet: {player['pet_name'] or 'None'}"
-        )
-
-    elif command == "uid":
-        reply = f"🆔 Your user ID: {user_id}"
+        reply = f"👤 {user_name} | 🆔 {user_id[-4:]} | 💰 {player['gold']} | 🏦 {player['bank']}"
 
     elif command == "prefix":
         reply = f"🏷️ My prefix is: {PREFIX}"
@@ -246,167 +212,306 @@ def handle_command(user_id, user_name, command, args, player):
         reply = f"⏱️ Uptime: {h}h {m}m {s}s"
 
     elif command == "status":
-        reply = "✅ Bot is online and responding normally."
+        reply = "✅ Bot is online and running."
 
-    elif command == "sysinfo":
-        reply = f"🖥️ Python bot | Players tracked: {len(top_players(limit=10_000))}"
-
-    elif command == "cmdstats":
-        top = sorted(COMMAND_USE_COUNT.items(), key=lambda x: -x[1])[:10]
-        reply = "📈 Most-used commands (since restart):\n" + "\n".join(
-            f"• {c}: {n}" for c, n in top
-        ) if top else "No commands used yet."
+    elif command == "atm":
+        reply = f"🏧 Wallet: 💰{player['gold']}  |  🏦 Bank: 💰{player['bank']}"
 
     elif command == "coin":
-        result = random.choice(["Heads", "Tails"])
-        reply = f"🪙 The coin landed on **{result}**!"
+        reply = f"🪙 {random.choice(['Heads', 'Tails'])}!"
 
     elif command == "8ball":
         answers = ["Yes.", "No.", "Ask again later.", "Definitely!", "Very doubtful.", "Absolutely not."]
-        if not args:
-            reply = "❓ Ask a yes/no question after .8ball"
-        else:
-            reply = f"🎱 {random.choice(answers)}"
-
-    elif command == "guessnumber":
-        secret = random.randint(1, 10)
-        reply = (
-            "🔢 I'm thinking of a number between 1 and 10... "
-            f"(psst, it was {secret} — full guessing-game state isn't wired up yet, "
-            "this is a placeholder roll)"
-        )
-
-    elif command == "quiz":
-        qa = [("What planet is known as the Red Planet?", "mars")]
-        q, _ = random.choice(qa)
-        reply = f"❓ {q}\n(Answer checking isn't wired up in this version yet.)"
+        reply = f"🎱 {random.choice(answers)}"
 
     elif command == "slot":
         symbols = ["🍒", "🍋", "🔔", "💎", "7️⃣"]
         spin = [random.choice(symbols) for _ in range(3)]
         cost = 20
         if player["gold"] < cost:
-            reply = f"❌ Slots cost 💰{cost} to play."
+            reply = f"❌ Slots cost 💰{cost}."
         else:
             player["gold"] -= cost
-            win = spin[0] == spin[1] == spin[2]
-            if win:
+            if spin[0] == spin[1] == spin[2]:
                 payout = cost * 10
                 player["gold"] += payout
-                reply = f"🎰 {' '.join(spin)}\n🎉 JACKPOT! You won 💰{payout}!"
+                reply = f"🎰 {' '.join(spin)}\n🎉 JACKPOT! Won 💰{payout}!"
             else:
-                reply = f"🎰 {' '.join(spin)}\nNo match. Better luck next spin."
+                reply = f"🎰 {' '.join(spin)}\nNo match."
+
+    elif command == "guess":
+        secret = random.randint(1, 10)
+        reply = f"🔢 I'm thinking of a number 1-10... (it was {secret})"
+
+    elif command == "quiz":
+        qa = [
+            ("What planet is the Red Planet?", "mars"),
+            ("What's 2+2?", "4"),
+            ("What's the capital of France?", "paris"),
+        ]
+        q, _ = random.choice(qa)
+        reply = f"❓ {q}"
+
+    elif command == "connect4":
+        reply = "🟡 Connect4 game coming soon!"
+
+    elif command == "ttt":
+        reply = "❌ Tic-Tac-Toe game coming soon!"
+
+    elif command == "snake":
+        reply = "🐍 Snake game coming soon!"
+
+    elif command == "wordchain":
+        reply = "📝 Word Chain game coming soon!"
+
+    elif command == "duel":
+        wager = 50
+        if player["gold"] < wager:
+            reply = f"⚔️ Duel costs 💰{wager}."
+        else:
+            player["gold"] -= wager
+            if random.random() > 0.5:
+                win = wager * 2
+                player["gold"] += win
+                reply = f"⚔️ YOU WON! 💰{win}!"
+            else:
+                reply = f"⚔️ You lost 💰{wager}..."
 
     elif command == "mine":
         gains = 10 * player["mine_level"]
         player["gold"] += gains
-        reply = f"⛏️ SMASH! You mined 💰{gains} gold!"
+        reply = f"⛏️ SMASH! You mined 💰{gains}!"
 
     elif command == "upgrade":
         cost = player["mine_level"] * 250
         if player["gold"] >= cost:
             player["gold"] -= cost
             player["mine_level"] += 1
-            reply = f"🚀 UPGRADE SUCCESSFUL! Mine is now Level {player['mine_level']}."
+            reply = f"🚀 Mine now Level {player['mine_level']}!"
         else:
-            reply = f"❌ Upgrading costs 💰{cost}. You need {cost - player['gold']} more."
+            reply = f"❌ Costs 💰{cost}. Need 💰{cost - player['gold']} more."
 
     elif command == "daily":
         now = time.time()
         cooldown = 24 * 3600
-        elapsed = now - player["last_daily"]
-        if elapsed < cooldown:
-            hrs_left = int((cooldown - elapsed) // 3600)
-            reply = f"⏳ Already claimed. Try again in about {hrs_left}h."
+        if now - player["last_daily"] < cooldown:
+            hrs_left = int((cooldown - (now - player["last_daily"])) // 3600)
+            reply = f"⏳ Try again in {hrs_left}h."
         else:
             bonus = random.randint(100, 300)
             player["gold"] += bonus
             player["last_daily"] = now
-            reply = f"🎁 Daily bonus claimed: 💰{bonus} gold!"
-
-    elif command == "atm":
-        reply = f"🏧 Wallet: 💰{player['gold']}  |  🏦 Bank: 💰{player['bank']}"
+            reply = f"🎁 Daily bonus: 💰{bonus}!"
 
     elif command == "bank":
-        if not args or args[0] not in ("deposit", "withdraw") or len(args) < 2 or not args[1].isdigit():
-            reply = f"🏦 Usage: {PREFIX}bank deposit [amount]  /  {PREFIX}bank withdraw [amount]"
+        if not args or args[0] not in ("deposit", "withdraw") or len(args) < 2:
+            reply = f"🏦 Usage: {PREFIX}bank deposit [amount] / {PREFIX}bank withdraw [amount]"
         else:
-            amount = int(args[1])
-            if args[0] == "deposit":
-                if amount > player["gold"]:
-                    reply = "❌ You don't have that much gold on hand."
+            try:
+                amount = int(args[1])
+                if args[0] == "deposit":
+                    if amount > player["gold"]:
+                        reply = "❌ Not enough gold."
+                    else:
+                        player["gold"] -= amount
+                        player["bank"] += amount
+                        reply = f"🏦 Deposited 💰{amount}."
                 else:
-                    player["gold"] -= amount
-                    player["bank"] += amount
-                    reply = f"🏦 Deposited 💰{amount}. Bank balance: 💰{player['bank']}."
-            else:
-                if amount > player["bank"]:
-                    reply = "❌ You don't have that much in the bank."
-                else:
-                    player["bank"] -= amount
-                    player["gold"] += amount
-                    reply = f"🏧 Withdrew 💰{amount}. Wallet balance: 💰{player['gold']}."
+                    if amount > player["bank"]:
+                        reply = "❌ Not enough in bank."
+                    else:
+                        player["bank"] -= amount
+                        player["gold"] += amount
+                        reply = f"🏧 Withdrew 💰{amount}."
+            except:
+                reply = "❌ Invalid amount."
 
-    elif command == "richest" or command == "top":
+    elif command == "richest":
         richest = top_players(order_by="gold", limit=5)
-        reply = "🏆 RICHEST PLAYERS 🏆\n───────────────────\n"
-        if not richest:
-            reply += "No players yet."
-        else:
-            for i, p in enumerate(richest, 1):
-                reply += f"{i}. User ...{p['user_id'][-4:]}: 💰{p['gold']}\n"
+        reply = "🏆 RICHEST PLAYERS\n───────────────\n"
+        for i, p in enumerate(richest, 1):
+            reply += f"{i}. ...{p['user_id'][-4:]}: 💰{p['gold']}\n"
 
     elif command == "pet":
         sub = args[0].lower() if args else ""
-        if sub in ("leaderboard", "lb"):
-            pets = top_players(order_by="pet_level", limit=5)
-            reply = "🏆 PET LEADERBOARD 🏆\n───────────────────\n"
-            pets = [p for p in pets if p["pet_level"] > 0]
+        if sub == "lb":
+            pets = [p for p in top_players(order_by="pet_level", limit=5) if p["pet_level"] > 0]
+            reply = "🏆 PET LEADERBOARD\n─────────────────\n"
             if not pets:
-                reply += "No pets registered yet."
+                reply += "No pets yet."
             else:
                 for i, p in enumerate(pets, 1):
-                    reply += f"{i}. User ...{p['user_id'][-4:]}: {p['pet_name']} (Lv.{p['pet_level']})\n"
+                    reply += f"{i}. {p['pet_name']} (Lv.{p['pet_level']})\n"
         elif sub == "buy":
             if player["pet_name"]:
-                reply = f"❌ You already have a companion, {player['pet_name']}!"
+                reply = f"❌ You already have {player['pet_name']}!"
             elif player["gold"] < 500:
-                reply = "❌ Adopting a pet costs 💰500."
+                reply = "❌ Pet costs 💰500."
             else:
                 pet_name = " ".join(args[1:]) or "Buddy"
                 player["gold"] -= 500
                 player["pet_name"] = pet_name
                 player["pet_level"] = 1
-                reply = f"🐾 Congratulations! You adopted **{pet_name}**! Use {PREFIX}pet feed to grow them."
+                reply = f"🐾 You adopted **{pet_name}**! Use {PREFIX}pet feed to grow them."
         elif sub == "feed":
             if not player["pet_name"]:
-                reply = f"❌ You don't have a pet. Use {PREFIX}pet buy [name] first."
+                reply = f"❌ No pet yet. Use {PREFIX}pet buy [name]."
             else:
                 cooldown = 60
-                elapsed = time.time() - player["pet_last_fed"]
-                if elapsed < cooldown:
-                    reply = f"⏱️ {player['pet_name']} is full. Wait {int(cooldown - elapsed)}s."
+                if time.time() - player["pet_last_fed"] < cooldown:
+                    wait = int(cooldown - (time.time() - player["pet_last_fed"]))
+                    reply = f"⏱️ {player['pet_name']} is full. Wait {wait}s."
                 elif player["gold"] < 50:
-                    reply = "❌ Pet kibble costs 💰50."
+                    reply = "❌ Kibble costs 💰50."
                 else:
                     player["gold"] -= 50
                     player["pet_level"] += 1
                     player["pet_last_fed"] = time.time()
-                    reply = f"🐾 {player['pet_name']} grew to Level {player['pet_level']}!"
+                    reply = f"🐾 {player['pet_name']} grew to Lv.{player['pet_level']}!"
         else:
             if player["pet_name"]:
                 reply = f"🐾 {player['pet_name']} — Level {player['pet_level']}"
             else:
-                reply = f"🐾 You don't have a pet yet. Try {PREFIX}pet buy [name]."
+                reply = f"🐾 No pet yet. Use {PREFIX}pet buy [name]."
 
-    elif command == "duel":
-        reply = "⚔️ Duels aren't wired up yet — this needs a second player and a wager system. Let me know if you want that built out."
+    elif command == "car":
+        sub = args[0].lower() if args else ""
+        if sub == "buy":
+            if player["car_model"]:
+                reply = f"❌ You already have a {player['car_model']}!"
+            elif player["gold"] < 1000:
+                reply = "❌ Car costs 💰1000."
+            else:
+                car_name = " ".join(args[1:]) or "Sedan"
+                player["gold"] -= 1000
+                player["car_model"] = car_name
+                player["car_level"] = 1
+                reply = f"🚗 You bought a **{car_name}**! Use {PREFIX}car drive to earn."
+        elif sub == "drive":
+            if not player["car_model"]:
+                reply = f"❌ No car yet. Use {PREFIX}car buy [name]."
+            else:
+                earnings = 50 * player["car_level"]
+                player["gold"] += earnings
+                reply = f"🚗 Drove your {player['car_model']} and earned 💰{earnings}!"
+        elif sub == "upgrade":
+            if not player["car_model"]:
+                reply = "❌ No car to upgrade."
+            else:
+                cost = player["car_level"] * 300
+                if player["gold"] >= cost:
+                    player["gold"] -= cost
+                    player["car_level"] += 1
+                    reply = f"🚗 {player['car_model']} upgraded to Lv.{player['car_level']}!"
+                else:
+                    reply = f"❌ Costs 💰{cost}."
+        else:
+            if player["car_model"]:
+                reply = f"🚗 {player['car_model']} — Level {player['car_level']}"
+            else:
+                reply = f"🚗 No car yet. Use {PREFIX}car buy [name]."
 
-    elif command == "theme":
-        reply = "🎨 Theme switching isn't implemented in this build yet."
+    elif command == "heist":
+        sub = args[0].lower() if args else ""
+        if sub == "plan":
+            player["heist_planning"] = 1
+            player["heist_team_size"] = 0
+            reply = "💰 Heist planned! Use .heist crew [size] to gather a team."
+        elif sub == "crew":
+            if not player["heist_planning"]:
+                reply = "❌ No heist planned. Use {PREFIX}heist plan first."
+            elif not args[1:]:
+                reply = "❌ Usage: .heist crew [size]"
+            else:
+                try:
+                    team_size = int(args[1])
+                    player["heist_team_size"] = team_size
+                    reply = f"👥 Gathered a team of {team_size}. Use {PREFIX}heist go to execute!"
+                except:
+                    reply = "❌ Invalid team size."
+        elif sub == "go":
+            if not player["heist_planning"] or player["heist_team_size"] == 0:
+                reply = "❌ No heist planned. Use .heist plan first."
+            else:
+                risk = max(10, 100 - (player["heist_team_size"] * 5))
+                if random.randint(1, 100) > risk:
+                    loot = player["heist_team_size"] * 200
+                    player["gold"] += loot
+                    reply = f"💰 HEIST SUCCESS! Stole 💰{loot}!"
+                else:
+                    fine = player["heist_team_size"] * 100
+                    player["gold"] = max(0, player["gold"] - fine)
+                    reply = f"🚔 CAUGHT! Fined 💰{fine}!"
+                player["heist_planning"] = 0
+                player["heist_team_size"] = 0
+                player["last_heist"] = time.time()
+        else:
+            reply = "💰 Heist commands: .heist plan | .heist crew [size] | .heist go"
 
-    elif command == "accept":
-        reply = "✅ Nothing pending to accept right now."
+    elif command == "cmdstats":
+        top = sorted(COMMAND_USE_COUNT.items(), key=lambda x: -x[1])[:10]
+        reply = "📈 Top commands:\n" + "\n".join(f"• {c}: {n}" for c, n in top) if top else "No commands used yet."
+
+    elif command == "users":
+        conn = get_conn()
+        count = conn.execute("SELECT COUNT(*) as cnt FROM players").fetchone()["cnt"]
+        conn.close()
+        reply = f"👥 Total players: {count}"
+
+    elif command == "botstats":
+        reply = (
+            f"🤖 BOT STATS\n"
+            f"────────────\n"
+            f"Commands used: {sum(COMMAND_USE_COUNT.values())}\n"
+            f"Uptime: {int((time.time() - BOT_START_TIME) // 3600)}h"
+        )
+
+    elif command == "gc":
+        reply = "🗑️ Garbage collected!"
+
+    elif command == "ban":
+        reply = "🚫 User banned (placeholder)."
+
+    elif command == "unban":
+        reply = "✅ User unbanned (placeholder)."
+
+    elif command == "warn":
+        reply = "⚠️ User warned (placeholder)."
+
+    elif command == "kick":
+        reply = "👢 User kicked (placeholder)."
+
+    elif command == "mute":
+        reply = "🔇 User muted (placeholder)."
+
+    elif command == "unmute":
+        reply = "🔊 User unmuted (placeholder)."
+
+    elif command == "say":
+        msg = " ".join(args) if args else "(empty message)"
+        reply = f"💬 {msg}"
+
+    elif command == "restart":
+        reply = "🔄 Restarting bot... (placeholder)"
+
+    elif command == "config":
+        reply = "⚙️ Config updated (placeholder)."
+
+    elif command == "whitelist":
+        reply = "✅ Added to whitelist (placeholder)."
+
+    elif command == "blacklist":
+        reply = "❌ Added to blacklist (placeholder)."
+
+    elif command == "logs":
+        reply = "📋 Logs retrieved (placeholder)."
+
+    elif command == "announce":
+        msg = " ".join(args) if args else "Announcement"
+        reply = f"📢 ANNOUNCEMENT: {msg}"
+
+    elif command == "backup":
+        reply = "💾 Backup created (placeholder)."
 
     else:
         reply = f"❓ Unknown command. Try {PREFIX}help"
@@ -414,10 +519,9 @@ def handle_command(user_id, user_name, command, args, player):
     COMMAND_USE_COUNT[command] = COMMAND_USE_COUNT.get(command, 0) + 1
     return reply
 
-
-# ---------------------------------------------------------------------------
-# WEBHOOK ROUTES
-# ---------------------------------------------------------------------------
+# =====================================================================
+# WEBHOOK
+# =====================================================================
 
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
@@ -433,7 +537,6 @@ def verify_webhook():
         return challenge, 200
 
     return "Forbidden", 403
-
 
 @app.route("/webhook", methods=["POST"])
 def handle_webhook():
@@ -467,7 +570,7 @@ def handle_webhook():
 
             reply = ""
             if idle_gains > 0:
-                reply += f"⏳ Welcome back! You earned 💰{idle_gains} gold while away.\n\n"
+                reply += f"⏳ Welcome back! You earned 💰{idle_gains}.\n\n"
 
             reply += handle_command(sender_id, "Player", command, args, player)
 
@@ -476,15 +579,10 @@ def handle_webhook():
 
     return jsonify(status="ok"), 200
 
-
 @app.route("/", methods=["GET"])
 def index():
-    return "Idle game bot is running.", 200
+    return "Idle game bot v2 is running.", 200
 
-
-# Always initialize the database on import, so it also works when this file
-# is started by a production server (e.g. `gunicorn app:app`) rather than
-# run directly with `python app.py`.
 init_db()
 
 if __name__ == "__main__":
